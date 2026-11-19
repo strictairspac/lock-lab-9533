@@ -7,7 +7,8 @@
 团队原先通过纸质交接单、SQL 截图和 Excel 交接。三处痛点：样本版本难统一、并发移交容易重复、超时后无法确认回执是否回滚。上游为样本接收记录，本站承接样本登记、移交申请、并发复核和证据导出，下游为理化检测室与复核员。
 
 - 样本台账：批次、可用份数、保管位置，可录入。
-- 流转申请：关联样本、指定数量和接收实验室。
+- 流转申请：关联样本、指定数量和接收实验室；同一编号支持更正，按 `version` 认最新版本。
+- 签收核销：签收单可乱序、先于申请登记；申请补齐或更正后由 worker 自动对账核销，展示已核数量与待核原因。
 - 并发执行：Redis 队列、独立 Python worker、可设锁等待上限。
 - 冲突证据：Backend PID、SQLSTATE、回执回滚、数量守恒与 JSON 导出。
 - 管理员审计：登录、写入和执行动作。
@@ -40,6 +41,21 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 单 worker 顺序运行任务，无生产重试/崩溃恢复调度；worker中断时 running 任务需要人工重建，不能用作生产样本库存扣减。
 
+## 签收核销与版本化更正
+
+签收（signoff）与移交申请（transfer）解耦入库，解决乱序到达、更正重算与并发争用。
+
+- **乱序到达**：签收单以 `transfer_code` 字符串关联，无外键强制，申请未到也能登记，状态 `pending`、原因 `application_missing`。申请补齐后在同一事务锁账本并入队，worker 自动核销。
+- **版本化更正**：`PUT /transfers/{id}` 不新增申请行，只把 `version += 1` 并覆盖数量/接收方；对账始终读最新版本。已核数量 `verified_qty` 单调递增、**绝不回退**。
+- **超量处理**：最新额度不足以覆盖已核总量时，保留每单原已核数量并把状态标为 `pending`、原因 `quota_insufficient`；后续放量更正腾出额度后自动重算恢复。
+- **并发安全**：登记签收、新建申请、更正都先 `INSERT ... ON CONFLICT` 占位再 `SELECT ... FOR UPDATE` 锁 `transfer_ledgers` 单行，对账任务也锁同一行，争同一余额时在锁上排队，配合 3000ms `lock_timeout`。
+- **不漏核**：每个写事件在持锁事务内幂等入对账任务（partial unique index 保证同申请仅一个 `queued/running` 任务）；事件还把账本续跑游标 `last_cursor_id` 归零，强制下一轮全量重算。
+- **中断续跑**：worker 启动时把遗留 `running` 任务重置为 `queued`；单轮扫描上限 `BATCH_LIMIT=500`，超限则落游标并在提交后排 `resume` 任务从游标继续。
+- **重试幂等**：核销结果只取决于当前行数据，重跑结果不变；签收单编号唯一，重复提交返回 200 与原单，不重复入队、不重复核销。
+- **待核原因**：`application_missing`（申请未到）、`queued`（等待调度）、`quota_insufficient`（额度不足），移交页与签收接口均返回中文说明。
+
+测试（真实 PostgreSQL，无 mock）：`tests/test_reconcile.py`（8 场景 30 断言）、`tests/test_stress.py`（多线程混合并发与 30 次反复更正）、`tests/test_http_flow.py`（FastAPI + Redis worker 端到端 17 断言）。
+
 ## 工程说明
 
 |服务|技术|职责|
@@ -50,8 +66,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 |db|PostgreSQL16|业务数据、隔离镜像账本|
 |redis|Redis7|持久队列|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。
-核心实体 Sample、Transfer、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`、`002_signoff_recon.sql`。
+核心实体 Sample、Transfer（含 version）、Signoff、TransferLedger、ReconJob、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states/signoff states/recon states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；演练状态枚举 queued/running/completed/failed，签收状态 pending/verified，对账状态 queued/running/done/failed。两个后端中间件：request_id/errors。
 
 环境变量见 `.env.example`：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅用于本地演示；JWT8小时有效。seed按自然键仅插入缺失行，不覆盖修改。所有5服务有健康检查，backend/worker依赖健康数据库/Redis，frontend依赖backend；db/redis/artifacts使用命名卷。停止及清空本项目数据：`docker compose down -v --remove-orphans`。
 
